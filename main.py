@@ -19,17 +19,38 @@ from datetime import datetime, timezone
 
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
-SEED = 20261112
-TRIALS = 1500
-STEP_H = 3.0
-CAP = 0.25
-SUM_TARGET = 0.85
+SEED = int(os.environ.get("MF_SEED", "20261112"))
+TRIALS = int(os.environ.get("MF_TRIALS", "1500"))
+STEP_H = float(os.environ.get("MF_STEP_H", "3.0"))
+CAP = float(os.environ.get("MF_CAP", "0.25"))
+SUM_TARGET = float(os.environ.get("MF_SUM_TARGET", "0.85"))
+TEMP = float(os.environ.get("MF_TEMP", "1.0"))
+VEL_CLAMP = float(os.environ.get("MF_VEL_CLAMP", "0.02"))
+VEL_WINDOW = float(os.environ.get("MF_VEL_WINDOW", "24"))
+PLAY_DRIFT = float(os.environ.get("MF_PLAY_DRIFT", "1.0"))
+PLAY_CLAMP = float(os.environ.get("MF_PLAY_CLAMP", "0.04"))
+DEBUT_BONUS = float(os.environ.get("MF_DEBUT", "0.5"))
+DEBUT_H = float(os.environ.get("MF_DEBUT_H", "48"))
+TENURE_DAYS = float(os.environ.get("MF_TENURE_DAYS", "28"))
+DRIFT_HL = float(os.environ.get("MF_DRIFT_HALF_LIFE", "24.0"))
+BLEND = float(os.environ.get("MF_BLEND", "0.05"))  # v4: 5% blend toward persistence forecast (round 3, verified +0.622 late)
+SIGMA_MID = float(os.environ.get("MF_SIGMA_MID", "1.0"))
+SIGMA_SCALE = float(os.environ.get("MF_SIGMA_SCALE", "1.0"))
+CLIMB_PBOOST = float(os.environ.get("MF_CLIMB_PBOOST", "1.0"))
+CLIMB_VMULT = float(os.environ.get("MF_CLIMB_VMULT", "1.0"))
+CLIMB_VTHRESH = float(os.environ.get("MF_CLIMB_VTHRESH", "-0.01"))
+CLIMB_RMIN = int(os.environ.get("MF_CLIMB_RMIN", "11"))
+RENORM = int(os.environ.get("MF_RENORM", "1"))  # v4: redistribute capped excess instead of discarding (round 3)
+CAP1 = float(os.environ.get("MF_CAP1", "0"))
+VEL_SHRINK = float(os.environ.get("MF_VEL_SHRINK", "0.3"))  # v4: damp noisy 24h velocity to 30% (round 3, verified +0.622 late)
 # Tuned (v3 aggressive): Student-t innovations (df 5) match the heavy tails of
 # log-rank moves (kurtosis ~15.8); breakout blend at 0.6x — smaller than the
 # safe 0.75x, a bet that the final window behaves like the late rolling cuts
 # (where 0.6x won biggest), at the cost of ~0.13 practice score.
-T_DF = 5.0
-BREAKOUT_SCALE = 0.6
+T_DF = float(os.environ.get("MF_T_DF", "5.0"))
+BREAKOUT_SCALE = float(os.environ.get("MF_BREAKOUT_SCALE", "0.6"))
+REV_SCALE = float(os.environ.get("MF_MEAN_REV", "0.5"))
+HORIZON_K = float(os.environ.get("MF_SIGMA_HORIZON", "0"))
 
 
 def parse_time(s):
@@ -143,7 +164,7 @@ def main():
         # Velocity: slope of log-rank vs time over the last 24h.
         v24 = 0.0
         win_pts = [(t.timestamp(), math.log(r)) for (t, r) in pts
-                   if r and last_ts - t.timestamp() <= 24 * 3600.0]
+                   if r and last_ts - t.timestamp() <= VEL_WINDOW * 3600.0]
         if len(win_pts) >= 2:
             xs = [x for x, _ in win_pts]
             ys = [y for _, y in win_pts]
@@ -153,7 +174,8 @@ def main():
             if den > 0:
                 # slope per second -> per hour
                 v24 = sum((x - mx) * (y - my) for x, y in win_pts) / den * 3600.0
-        v24 = max(-0.02, min(0.02, v24))
+        v24_raw = v24
+        v24 = max(-VEL_CLAMP, min(VEL_CLAMP, v24 * VEL_SHRINK))
         # Playing growth.
         p_now = g.get("playing")
         p24 = value_at(play_series, uid, 24)
@@ -166,8 +188,8 @@ def main():
         g_step = math.log(p_now / p_prev) if p_now and p_prev else 0.0
         g24 = math.log(p_now / p24) if p_now and p24 else 0.0
         g48 = math.log(p_now / p48) if p_now and p48 else 0.0
-        play_v = -0.01 * (g24 + g48)
-        play_v = max(-0.04, min(0.04, play_v))
+        play_v = -0.01 * PLAY_DRIFT * (g24 + g48)
+        play_v = max(-PLAY_CLAMP, min(PLAY_CLAMP, play_v))
         # Visits growth, when details carry it (final history only).
         v24g = 0.0
         if visits_series.get(uid):
@@ -187,6 +209,9 @@ def main():
             sigma = 0.078
         else:
             sigma = 0.055
+        if 11 <= r0 <= 50:
+            sigma *= SIGMA_MID
+        sigma *= SIGMA_SCALE
         first_t = pts[0][0].timestamp() if pts else last_ts
         if last_ts - first_t < 48 * 3600.0:
             sigma *= 1.2
@@ -194,8 +219,8 @@ def main():
         expiry_ts = None
         det = details.get(uid) or {}
         created = parse_time(det.get("created")) if det else None
-        if created is not None:
-            expiry_ts = created.timestamp() + 28 * 86400.0
+        if created is not None and TENURE_DAYS > 0:
+            expiry_ts = created.timestamp() + TENURE_DAYS * 86400.0
         # Breakout score: surging playing, and a big climb over 72h.
         rank72 = rank_at(uid, 72)
         d72 = (r0 - rank72) if rank72 else 0
@@ -212,13 +237,15 @@ def main():
         # surging has almost no rank history, so its MC diffusion is
         # anchored on a noisy rank; give its breakout score a flat
         # bonus so the blend allocates it more top-place mass.
-        if last_ts - first_t < 48 * 3600.0 and (g_step > 0.5 or g24 > 0.8):
-            score += 0.5
+        if last_ts - first_t < DEBUT_H * 3600.0 and (g_step > 0.5 or g24 > 0.8):
+            score += DEBUT_BONUS
         if score > 0:
             breakout[uid] = score
         states.append({
             "uid": uid, "x": lr, "v": v24, "mean": mean_lr,
             "sigma": sigma, "play_v": play_v, "expiry": expiry_ts,
+            "r0": r0, "v_raw": v24_raw,
+            "climb": (r0 >= CLIMB_RMIN and v24_raw < CLIMB_VTHRESH),
         })
 
     rng = random.Random(SEED)
@@ -232,15 +259,16 @@ def main():
         for step in range(steps):
             elapsed = step * STEP_H
             t_now = win_from_ts + elapsed * 3600.0
-            decay = math.exp(-elapsed / 24.0)
+            decay = math.exp(-elapsed / DRIFT_HL)
             for i, s in enumerate(states):
                 if s["expiry"] is not None and t_now >= s["expiry"]:
                     xs[i] = 999.0
                     continue
                 if xs[i] >= 900.0:
                     continue
-                v_eff = s["v"] * decay + s["play_v"] * decay
-                rev = (0.114 - 0.033 * xs[i]) * (STEP_H / 6.0) * 0.5
+                v_base = s["v"] * (CLIMB_VMULT if s.get("climb") else 1.0)
+                v_eff = v_base * decay + s["play_v"] * decay
+                rev = (0.114 - 0.033 * xs[i]) * (STEP_H / 6.0) * REV_SCALE
                 # Student-t innovation (df 5), rescaled to unit variance
                 # (var t_df = df/(df-2)); heavy tails match the observed
                 # log-rank kurtosis (~15.8).
@@ -248,7 +276,7 @@ def main():
                 chi = rng.gammavariate(T_DF / 2.0, 2.0)
                 noise = (z / math.sqrt(chi / T_DF)
                          / math.sqrt(T_DF / (T_DF - 2.0))
-                         * s["sigma"] * math.sqrt(STEP_H))
+                         * s["sigma"] * (1.0 + HORIZON_K * elapsed / 72.0) * math.sqrt(STEP_H))
                 xs[i] = xs[i] + v_eff * STEP_H + rev + noise
             order = sorted(range(len(uids)), key=lambda i: xs[i])
             for place_idx, gi in enumerate(order[:places]):
@@ -265,11 +293,21 @@ def main():
             if c > 0:
                 entries.append((uid, c / total))
         entries.sort(key=lambda x: (-x[1], x[0]))
-        capped = [(u, min(p, CAP)) for u, p in entries]
+        cap_here = CAP1 if (place == 1 and CAP1 > 0) else CAP
+        capped = [(u, min(p, cap_here)) for u, p in entries]
         ssum = sum(p for _, p in capped)
         if ssum > SUM_TARGET:
             scale = SUM_TARGET / ssum
             capped = [(u, p * scale) for u, p in capped]
+        elif RENORM and ssum > 0:
+            scale = SUM_TARGET / ssum
+            capped = [(u, p * scale) for u, p in capped]
+        if TEMP != 1.0:
+            tsum = sum(p for _, p in capped)
+            if tsum > 0:
+                powered = [(u, p ** TEMP) for u, p in capped]
+                psum = sum(p for _, p in powered)
+                capped = [(u, p * tsum / psum) for u, p in powered]
         for uid, p in capped:
             if p >= 0.002:
                 probs.append({"universe_id": uid, "place": place, "p": round(p, 4)})
@@ -296,6 +334,60 @@ def main():
                     new_probs.append({"universe_id": uid, "place": place,
                                       "p": round(p, 4)})
         probs = new_probs
+
+    # Targeted climber boost: multiply the final per-place probability of
+    # rank-11+ games with strong upward velocity, renormalizing each place
+    # to its pre-boost sum (mass comes from non-climbers at the same place).
+    if CLIMB_PBOOST != 1.0:
+        climber_uids = {s["uid"] for s in states if s.get("climb")}
+        if climber_uids:
+            by_place3 = {}
+            for row in probs:
+                by_place3.setdefault(row["place"], {})[row["universe_id"]] = row["p"]
+            boosted = []
+            for place in range(1, places + 1):
+                named = by_place3.get(place, {})
+                ssum = sum(named.values())
+                new = {uid: (p * CLIMB_PBOOST if uid in climber_uids else p)
+                       for uid, p in named.items()}
+                nsum = sum(new.values())
+                if nsum > 0:
+                    new = {uid: p * ssum / nsum for uid, p in new.items()}
+                for uid, p in sorted(new.items(), key=lambda kv: (-kv[1], kv[0])):
+                    if p >= 0.002:
+                        boosted.append({"universe_id": uid, "place": place,
+                                        "p": round(p, 4)})
+            probs = boosted
+
+    # Persistence blend (house-baseline style): per place, 0.30 on the
+    # incumbent, 0.10 on each neighbour; mixed in with weight BLEND,
+    # preserving each place's named sum.
+    if BLEND > 0:
+        by_place2 = {}
+        for row in probs:
+            by_place2.setdefault(row["place"], {})[row["universe_id"]] = row["p"]
+        blended = []
+        for place in range(1, places + 1):
+            named = by_place2.get(place, {})
+            ssum = sum(named.values())
+            pers = {}
+            if place - 1 < len(uids):
+                pers[uids[place - 1]] = 0.30
+            if place >= 2:
+                pers[uids[place - 2]] = pers.get(uids[place - 2], 0.0) + 0.10
+            if place < len(uids):
+                pers[uids[place]] = pers.get(uids[place], 0.0) + 0.10
+            psum = sum(pers.values())
+            new = {}
+            for uid, pv in pers.items():
+                new[uid] = BLEND * ssum * pv / psum if psum > 0 else 0.0
+            for uid, pv in named.items():
+                new[uid] = new.get(uid, 0.0) + pv * (1.0 - BLEND)
+            for uid, pv in sorted(new.items(), key=lambda kv: (-kv[1], kv[0])):
+                if pv >= 0.002:
+                    blended.append({"universe_id": uid, "place": place,
+                                    "p": round(pv, 4)})
+        probs = blended
 
     # Top 10 by blended probability, weighted toward the top places.
     score10 = {}
